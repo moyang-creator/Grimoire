@@ -862,6 +862,18 @@ export class InputController {
           }
         }
 
+        this.deps.plugin.recordDebugLog?.({
+          data: {
+            autoSend: planAutoSendContent !== null,
+            planApprovalInvalidated,
+            shouldProcessQueuedMessage,
+            turnFailed,
+          },
+          event: 'chat.turn.end_branch',
+          level: 'debug',
+          scope: 'chat',
+        });
+
         if (!planApprovalInvalidated) {
           // Only clear resumeAtMessageId if enqueue succeeded; preserve checkpoint on failure for retry
           const saveExtras = didEnqueueToSdk ? { resumeAtMessageId: undefined } : undefined;
@@ -1023,7 +1035,34 @@ export class InputController {
 
   private processQueuedMessage(): void {
     const { state } = this.deps;
-    if (state.queue.isPaused || state.queue.size === 0) return;
+    // Every guard below used to return in silence, so a follow-up that never
+    // became a turn left no trace of why. Record the attempt and the guard that
+    // ended it; without this the log cannot tell "the drain was never called"
+    // from "the drain was called and declined".
+    const record = (event: string, reason: string, extra: Record<string, unknown> = {}): void => {
+      this.deps.plugin.recordDebugLog?.({
+        data: {
+          providerId: this.getActiveProviderId(),
+          queueSize: state.queue.size,
+          reason,
+          ...extra,
+        },
+        event,
+        level: 'debug',
+        scope: 'chat',
+      });
+    };
+
+    record('chat.queue.drain_entered', 'entered', {
+      isStreaming: state.isStreaming,
+      isPaused: state.queue.isPaused,
+      streamGeneration: state.streamGeneration,
+    });
+
+    if (state.queue.isPaused || state.queue.size === 0) {
+      // Not a decline: the queue was held on purpose or had nothing to send.
+      return;
+    }
 
     const queuedMessage = state.queue.peek();
     if (!queuedMessage) return;
@@ -1036,22 +1075,38 @@ export class InputController {
         // while `isStreaming` is still true, so the user can start this while
         // the previous turn is still winding down. Taking the message out of the
         // queue first would drop it on the floor when this guard fires.
+        const generationChanged = state.streamGeneration !== streamGeneration;
         if (
-          state.streamGeneration !== streamGeneration
+          generationChanged
           || state.isCreatingConversation
           || state.isSwitchingConversation
           || state.isStreaming
           || state.queue.isPaused
         ) {
+          record(
+            'chat.queue.drain_declined',
+            generationChanged ? 'generation'
+              : state.isCreatingConversation ? 'creating_conversation'
+              : state.isSwitchingConversation ? 'switching_conversation'
+              : state.isStreaming ? 'still_streaming'
+              : 'paused_after_defer',
+            {
+              isStreaming: state.isStreaming,
+              queuedGeneration: streamGeneration,
+              streamGeneration: state.streamGeneration,
+            }
+          );
           return;
         }
         // Compare before removing, never after: if the head moved while this
         // was deferred, dequeuing here would take a message this call never
         // agreed to send and drop it.
         if (state.queue.peek() !== queuedMessage) {
+          record('chat.queue.drain_declined', 'head_moved');
           return;
         }
         state.queue.dequeue();
+        record('chat.queue.drain_sent', 'sent', { remaining: state.queue.size });
         // The head leaving shifts every later position down by one, and a slot
         // held for an edited row is one of them.
         if (this.pendingEditIndex !== null && this.pendingEditIndex > 0) {

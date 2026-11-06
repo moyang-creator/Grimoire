@@ -3548,6 +3548,251 @@ describe('InputController - Message Queue', () => {
     });
   });
 
+  describe('a follow-up queued mid-turn drains when that turn ends', () => {
+    /**
+     * The reported failure: type while a turn is running, the message queues,
+     * the turn ends, the message never goes out. Both halves are unit-tested —
+     * enqueue while streaming, and processQueuedMessage from a clean state —
+     * so this drives the seam between them, which is the turn-end block.
+     */
+    it('sends the queued message as the next turn', async () => {
+      deps = createSendableDeps();
+      const mockAgentService = (deps as any).mockAgentService;
+      const recordDebugLog = jest.fn();
+      (deps.plugin as any).recordDebugLog = recordDebugLog;
+
+      // The first turn: it hands back a stream that ends, the way a real one
+      // does when the provider is done.
+      mockAgentService.query = jest.fn().mockReturnValue(createMockStream([
+        { type: 'text', content: 'first answer' },
+        { type: 'done' },
+      ]));
+
+      inputEl = deps.getInputEl();
+      inputEl.value = 'first question';
+      controller = new InputController(deps);
+
+      const firstTurn = controller.sendMessage();
+      // Mid-turn, with isStreaming true: this queues instead of sending.
+      deps.state.isStreaming = true;
+      inputEl.value = 'follow-up typed mid-turn';
+      await controller.sendMessage();
+
+      expect(deps.state.queue.size).toBe(1);
+
+      await firstTurn;
+      // The turn-end block drains through a setTimeout, and the drain's own
+      // send is async.
+      await new Promise(resolve => setTimeout(resolve, 0));
+      await new Promise(resolve => setTimeout(resolve, 0));
+
+      expect(deps.state.queue.size).toBe(0);
+      expect(mockAgentService.query).toHaveBeenCalledTimes(2);
+      const secondCall = (mockAgentService.query as jest.Mock).mock.calls[1];
+      expect(JSON.stringify(secondCall)).toContain('follow-up typed mid-turn');
+
+      const events = recordDebugLog.mock.calls.map(([event]) => event);
+      expect(events).toContainEqual(expect.objectContaining({ event: 'chat.turn.end_branch' }));
+      expect(events).toContainEqual(expect.objectContaining({
+        data: expect.objectContaining({ reason: 'entered' }),
+        event: 'chat.queue.drain_entered',
+      }));
+      expect(events).toContainEqual(expect.objectContaining({
+        data: expect.objectContaining({ reason: 'sent' }),
+        event: 'chat.queue.drain_sent',
+      }));
+      // A drain that ends in a decline is the failure being chased: this path
+      // must not produce one.
+      expect(events.filter(e => e.event === 'chat.queue.drain_declined')).toHaveLength(0);
+
+      // What each line recorded, since the reason alone does not say which
+      // branch the turn actually took.
+      const branch = events.find(e => e.event === 'chat.turn.end_branch');
+      expect(branch?.data).toMatchObject({
+        autoSend: false,
+        planApprovalInvalidated: false,
+        shouldProcessQueuedMessage: true,
+      });
+      const enteredEvent = events.find(e => e.event === 'chat.queue.drain_entered');
+      expect(enteredEvent?.data).toMatchObject({ isStreaming: false, isPaused: false, queueSize: 1 });
+    });
+
+    /**
+     * The shape the field log shows: several follow-ups typed during one long
+     * turn, none of which went out. The drain sends one per turn-end, so five
+     * queued means five turns — each of which must itself end and drain the
+     * next.
+     */
+    it('drains every follow-up queued during one turn, one turn each', async () => {
+      deps = createSendableDeps();
+      const mockAgentService = (deps as any).mockAgentService;
+      mockAgentService.query = jest.fn().mockImplementation(() =>
+        createMockStream([
+          { type: 'text', content: 'answer' },
+          { type: 'done' },
+        ]),
+      );
+
+      inputEl = deps.getInputEl();
+      inputEl.value = 'first question';
+      controller = new InputController(deps);
+
+      const firstTurn = controller.sendMessage();
+      deps.state.isStreaming = true;
+      for (const text of ['one', 'two', 'three', 'four', 'five']) {
+        inputEl.value = text;
+        await controller.sendMessage();
+      }
+      expect(deps.state.queue.size).toBe(5);
+
+      await firstTurn;
+
+      // Each drain sends one message, which opens the next turn; that turn
+      // ends and drains the one after it. Give the whole chain room to run.
+      for (let i = 0; i < 40; i++) {
+        await new Promise(resolve => setTimeout(resolve, 0));
+      }
+
+      expect(deps.state.queue.size).toBe(0);
+      // The original turn plus five drained ones.
+      expect(mockAgentService.query).toHaveBeenCalledTimes(6);
+    });
+
+    it('records still_streaming when the turn ends with isStreaming left true', async () => {
+      // The guard this observation exists for: if the turn-end block runs while
+      // isStreaming is still set, the drain declines and the follow-up stays in
+      // the queue. The reason is what tells this apart from a generation bump.
+      deps = createSendableDeps();
+      const recordDebugLog = jest.fn();
+      (deps.plugin as any).recordDebugLog = recordDebugLog;
+      controller = new InputController(deps);
+
+      deps.state.queue.enqueue({
+        content: 'follow-up',
+        images: undefined,
+        editorContext: null,
+        browserContext: null,
+        canvasContext: null,
+      });
+      deps.state.isStreaming = true;
+
+      (controller as any).processQueuedMessage();
+      await new Promise(resolve => setTimeout(resolve, 0));
+
+      const events = recordDebugLog.mock.calls.map(([event]) => event);
+      expect(events).toContainEqual(expect.objectContaining({
+        data: expect.objectContaining({ reason: 'still_streaming' }),
+        event: 'chat.queue.drain_declined',
+      }));
+      // Still held, which is the point: the guard did not take it out.
+      expect(deps.state.queue.size).toBe(1);
+    });
+
+    /**
+     * The narrowing the log has to make possible: a follow-up that survives the
+     * turn without going out. When the queue is paused by a failed turn the
+     * drain is supposed to hold it, and the log must say so rather than leave
+     * the same silence the original code did.
+     */
+    it('sends the follow-up even when a save is still running at turn end', async () => {
+      // The turn-end block awaits the conversation save with `isStreaming`
+      // already false. Anything the user types in that window starts a turn of
+      // its own, which bumps the generation — and the drain behind the save
+      // then sees a generation this turn did not open. That is the shape of the
+      // reported loss, so this pins the behaviour the fix must keep.
+      deps = createSendableDeps();
+      const mockAgentService = (deps as any).mockAgentService;
+      const recordDebugLog = jest.fn();
+      (deps.plugin as any).recordDebugLog = recordDebugLog;
+
+      mockAgentService.query = jest.fn().mockReturnValue(createMockStream([
+        { type: 'text', content: 'first answer' },
+        { type: 'done' },
+      ]));
+
+      let releaseSave: () => void = () => {};
+      const saveGate = new Promise<void>(resolve => { releaseSave = resolve; });
+      const originalSave = deps.conversationController.save;
+      (deps.conversationController as any).save = jest.fn().mockImplementation(
+        async (...args: unknown[]) => {
+          await saveGate;
+          return (originalSave as any).apply(deps.conversationController, args);
+        },
+      );
+
+      inputEl = deps.getInputEl();
+      inputEl.value = 'first question';
+      controller = new InputController(deps);
+
+      const firstTurn = controller.sendMessage();
+      deps.state.isStreaming = true;
+      inputEl.value = 'follow-up typed mid-turn';
+      await controller.sendMessage();
+      expect(deps.state.queue.size).toBe(1);
+
+      // Let the turn reach the save and park there.
+      for (let i = 0; i < 10; i++) {
+        await Promise.resolve();
+      }
+
+      // What the user does in that window: sends again. `isStreaming` is false
+      // by now, so this opens a turn of its own instead of queueing.
+      inputEl.value = 'typed after the turn ended';
+      void controller.sendMessage();
+      for (let i = 0; i < 5; i++) {
+        await Promise.resolve();
+      }
+
+      releaseSave();
+      await firstTurn;
+      await new Promise(resolve => setTimeout(resolve, 0));
+      await new Promise(resolve => setTimeout(resolve, 0));
+
+      const events = recordDebugLog.mock.calls.map(([event]) => event);
+      expect(events).toContainEqual(expect.objectContaining({ event: 'chat.turn.end_branch' }));
+
+      // The follow-up is the point of the test: queued mid-turn, and out the
+      // other side. A zero-size queue here is the reported bug.
+      expect(deps.state.queue.size).toBe(0);
+      const drained = events.find(e => e.event === 'chat.queue.drain_sent');
+      expect(drained).toBeDefined();
+      expect(events.filter(e => e.event === 'chat.queue.drain_declined')).toHaveLength(0);
+    });
+    it('holds the follow-up when the turn fails, and records that it held', async () => {
+      deps = createSendableDeps();
+      const mockAgentService = (deps as any).mockAgentService;
+      const recordDebugLog = jest.fn();
+      (deps.plugin as any).recordDebugLog = recordDebugLog;
+
+      mockAgentService.query = jest.fn().mockImplementation(() => {
+        return (async function* () {
+          yield { type: 'text', content: 'partial' };
+          throw new Error('provider fell over');
+        })();
+      });
+
+      inputEl = deps.getInputEl();
+      inputEl.value = 'first question';
+      controller = new InputController(deps);
+
+      const firstTurn = controller.sendMessage();
+      deps.state.isStreaming = true;
+      inputEl.value = 'follow-up typed mid-turn';
+      await controller.sendMessage();
+
+      await firstTurn;
+
+      const events = recordDebugLog.mock.calls.map(([event]) => event);
+      expect(events).toContainEqual(expect.objectContaining({
+        data: expect.objectContaining({ reason: 'failed' }),
+        event: 'chat.queue.paused',
+      }));
+      // Held, not dropped: still in the queue, still sendable by Resume.
+      expect(deps.state.queue.size).toBe(1);
+      expect(deps.state.queue.isPaused).toBe(true);
+    });
+  });
+
   describe('processQueuedMessage sends the queued snapshot', () => {
     it('should send images from the queued message without rebuilding composer state', () => {
       jest.useFakeTimers();
